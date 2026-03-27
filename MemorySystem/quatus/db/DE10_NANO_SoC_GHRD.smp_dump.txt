@@ -1,0 +1,15 @@
+
+State Machine - |DE10_NANO_SoC_GHRD|soc_system:u0|soc_system_mm_interconnect_0:mm_interconnect_0|altera_merlin_burst_adapter:mm_bridge_0_s0_burst_adapter|altera_merlin_burst_adapter_13_1:altera_merlin_burst_adapter_13_1.burst_adapter|state
+Name state.ST_IDLE state.ST_UNCOMP_WR_SUBBURST state.ST_UNCOMP_TRANS state.ST_COMP_TRANS 
+state.ST_IDLE 0 0 0 0 
+state.ST_COMP_TRANS 1 0 0 1 
+state.ST_UNCOMP_TRANS 1 0 1 0 
+state.ST_UNCOMP_WR_SUBBURST 1 1 0 0 
+
+State Machine - |DE10_NANO_SoC_GHRD|simple_mem:mem0|state
+Name state.RD_WAIT state.RD_BEAT state.WR_BEAT state.IDLE state.DONE 
+state.IDLE 0 0 0 0 0 
+state.WR_BEAT 0 0 1 1 0 
+state.RD_BEAT 0 1 0 1 0 
+state.RD_WAIT 1 0 0 1 0 
+state.DONE 0 0 0 1 1 

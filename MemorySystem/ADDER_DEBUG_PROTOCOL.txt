@@ -1,0 +1,281 @@
+DE10-Nano Simple Adder + pio128 — Protocol & Reverse Engineering Guide
+Board: DE10-Nano (Cyclone V 5CSEBA6U23I7)  SSH: root@192.168.0.2
+
+======================================================================
+ TL;DR — WHAT THIS DOES
+======================================================================
+
+  HPS (ARM CPU) talks to FPGA over the H2F bridge at 0xC0000000.
+  The FPGA has 4 memory-mapped registers (PIOs):
+
+    ADDRESS         WHAT               R/W    SIZE
+    0xC0000000      pio128 word 0      W      128-bit PIO (4 words)
+    0xC0000004      pio128 word 1      W      |
+    0xC0000008      pio128 word 2      W      |
+    0xC000000C      pio128 word 3      W      (byteenable-aware)
+    0xC0000010      sum (result)       R      } 64-bit status PIO
+    0xC0000014      debug word         R      }
+    0xC0000018      adder_b (operand2) W      } 64-bit PIO
+    0xC000001C      (don't touch)      W      } clears low half!
+    0xC0000020      adder_a (operand1) W      } 64-bit PIO
+    0xC0000024      (don't touch)      W      } clears low half!
+
+  FPGA computes: sum = adder_a[31:0] + adder_b[31:0]
+  Result readable at 0xC0000010. Also written to DDR3 at 0x3FFF003C.
+
+  The LW bridge (0xFF200000) is DISABLED. Do NOT use it — hangs the bus.
+
+======================================================================
+ TL;DR — HOW TO USE
+======================================================================
+
+  -- On your PC (after Quartus compile): --
+  cd MemorySystem/
+  make stage              # copies RBF to drag/
+  # copy drag/ folder to SD card FAT partition
+
+  -- On the board (SSH as root): --
+  mount /dev/mmcblk0p1 /mnt/bootfat
+  cd /mnt/bootfat/drag && make deploy && reboot
+
+  -- After reboot: --
+  cd /root/adder
+  make test               # runs the full adder verification
+
+  -- Or do it manually with devmem2: --
+  ./enable_bridges                                    # once per boot
+  ./devmem2 0xC0000014 w                              # debug word (0xDB = alive)
+  ./devmem2 0xC0000020 w w 0x1000                     # adder_a = 0x1000
+  ./devmem2 0xC0000018 w w 0x0234                     # adder_b = 0x0234
+  ./devmem2 0xC0000010 w                              # read sum -> 0x1234
+
+======================================================================
+ devmem2 CHEAT SHEET
+======================================================================
+
+  SYNTAX:  ./devmem2 <phys_addr> w           # read 32-bit word
+           ./devmem2 <phys_addr> w w <value>  # write 32-bit word
+
+  -- Bridge alive? --
+  ./devmem2 0xC0000014 w           # bits[31:24] must be 0xDB
+                                   # if 0x00 or hangs: no bitstream / bridges off
+
+  -- Write operands --
+  ./devmem2 0xC0000020 w w 0x1000  # operand 1 -> adder_a
+  ./devmem2 0xC0000018 w w 0x0234  # operand 2 -> adder_b
+
+  -- Read result --
+  ./devmem2 0xC0000010 w           # sum = adder_a + adder_b = 0x1234
+
+  -- DDR3 readback (FPGA auto-writes sum to DDR3) --
+  sleep 0.02                       # wait for Avalon write to finish
+  ./devmem2 0x3FFF003C w           # should match sum
+
+  -- 128-bit PIO (4 independent 32-bit words, byteenable-aware) --
+  ./devmem2 0xC0000000 w w 0xAA   # pio128[31:0]   = 0xAA
+  ./devmem2 0xC0000004 w w 0xBB   # pio128[63:32]  = 0xBB
+  ./devmem2 0xC0000008 w w 0xCC   # pio128[95:64]  = 0xCC
+  ./devmem2 0xC000000C w w 0xDD   # pio128[127:96] = 0xDD
+  # each word is independent -- writing one does NOT zero the others
+
+  -- DEADBEEF LED trigger --
+  ./devmem2 0xC0000018 w w 0x5        # set LED pattern first
+  ./devmem2 0xC0000020 w w 0xDEADBEEF # trigger: LED[3:0] latches 0101
+
+  -- Heartbeat check (is FPGA clock alive?) --
+  ./devmem2 0xC0000014 w; sleep 2; ./devmem2 0xC0000014 w
+  # bit 23 should flip between reads
+
+======================================================================
+ REVERSE ENGINEERING GUIDE — HOW IT ALL CONNECTS
+======================================================================
+
+  If you're reading this code for the first time, here's how to trace
+  from the HPS (Linux) side all the way down to the FPGA gates.
+
+  1. HPS SOFTWARE (C programs in drag/c_progs/)
+     The ARM CPU runs Linux. Programs use /dev/mem + mmap() to get a
+     virtual pointer to physical address 0xC0000000 (the H2F bridge).
+     32-bit reads/writes to that pointer go over the AXI bus into the
+     FPGA fabric. Key files:
+       adder_test.c    — main test (write operands, read sum, check DDR3)
+       enable_bridges.c — pokes Reset Manager (0xFFD0501C) to deassert
+                          bridge resets, then System Manager (0xFFD08028)
+                          to enable FPGA interfaces
+
+  2. BRIDGE PATH: HPS -> AXI -> Avalon -> PIOs
+     The AXI master in the HPS connects to an Avalon-MM bridge
+     (mm_bridge_0) inside the Qsys system.  The bridge fans out to
+     four slaves via an address-decoded interconnect:
+
+       Offset    Slave           Qsys instance       Export signal
+       0x00-0x0F pio128_out_0    128-bit write PIO    pio128_out_export
+       0x10-0x17 pio64_in_0      64-bit read PIO      adder_sum_export
+       0x18-0x1F pio64_out_1     64-bit write PIO     adder_b_export
+       0x20-0x27 pio64_out_0     64-bit write PIO     adder_a_export
+
+     Address decoding is in the generated file:
+       soc_system/synthesis/submodules/soc_system_mm_interconnect_2_router.sv
+     Look for the if-blocks matching address ranges to channel numbers.
+
+     The Qsys system definition is in:  quatus/soc_system.qsys
+     Generated Verilog:                 quatus/soc_system/synthesis/soc_system.v
+
+  3. FPGA LOGIC (quatus/DE10_NANO_SoC_GHRD.v)
+     This is the top-level file. It instantiates soc_system (the Qsys
+     block) and wires the PIO exports to combinational logic:
+
+       sum_a = adder_a_export[31:0] + adder_b_export[31:0]   // integer add
+       adder_sum_export = {debug_word, sum_a}                 // pack for readback
+
+     The debug_word (bits [63:32] of adder_sum) has a magic marker 0xDB
+     so you can tell the bridge is alive, plus status bits for heartbeat,
+     reset, dirty flag, and DDR3 write state.
+
+     The DEADBEEF trigger: when adder_a[31:0] == 0xDEADBEEF, LED[3:0]
+     latches adder_b[3:0].
+
+  4. DDR3 WRITE PATH
+     On every PIO change (pio_dirty), a small sequencer writes two
+     512-bit cache lines to DDR3 via an Avalon-MM master (simple_mem.sv):
+       0x3FFF0000: 64-byte line with sum_a in bits[511:480]
+       0x3FFF0040: 64-byte line with sum_b in bits[511:480]
+     simple_mem does 8 sequential 64-bit beats (no bursts).
+     The HPS can read sum_a at physical address 0x3FFF003C (last 32 bits
+     of the first 64-byte line, because sum_a is in the MSBs and
+     little-endian puts the upper 32 bits of beat 7 at offset +0x3C).
+
+  5. PIO INTERNALS
+     pio64_out.sv:  HPS writes set pio_out.  No byteenable = full 64-bit
+                    overwrite on every 32-bit write (clears the other half).
+                    Workaround: only use LOW 32 bits, one operand per PIO.
+     pio128_out.sv: HAS byteenable.  Each 32-bit write only changes 4 bytes.
+                    All 4 words can coexist.
+     pio64_in.sv:   Read-only. FPGA drives pio_in, HPS reads it.
+
+  6. LED ACCENT (what the board LEDs tell you)
+     LED[7] = heartbeat (1 Hz blink = FPGA alive)
+     LED[6] = pio_dirty (HPS wrote something)
+     LED[5] = DDR3 sequencer active
+     LED[4] = hps_fpga_reset_n (HPS running)
+     LED[3:0] = DEADBEEF latch
+
+======================================================================
+ PIO ADDRESS MAP — FULL DETAIL
+======================================================================
+
+  All offsets from H2F bridge base 0xC0000000.
+
+  Offset  Phys addr    Register            R/W   Notes
+  ------  ----------   ------------------  ----  ---------------------------
+  +0x00   0xC0000000   pio128[31:0]        W     128-bit PIO, word 0
+  +0x04   0xC0000004   pio128[63:32]       W     word 1
+  +0x08   0xC0000008   pio128[95:64]       W     word 2
+  +0x0C   0xC000000C   pio128[127:96]      W     word 3
+                                                 (byteenable: each word
+                                                  independent, no clobber)
+  +0x10   0xC0000010   adder_sum[31:0]     R     sum_a = a[31:0]+b[31:0]
+  +0x14   0xC0000014   adder_sum[63:32]    R     debug_word (see below)
+  +0x18   0xC0000018   adder_b[31:0]       W     operand 2
+  +0x1C   0xC000001C   adder_b[63:32]      W     AVOID: clears [31:0]!
+  +0x20   0xC0000020   adder_a[31:0]       W     operand 1 / DEADBEEF trigger
+  +0x24   0xC0000024   adder_a[63:32]      W     AVOID: clears [31:0]!
+
+  DDR3 (physical memory, read via /dev/mem):
+  0x3FFF003C   sum_a   (FPGA writes automatically after PIO change)
+  0x3FFF007C   sum_b
+
+======================================================================
+ DEBUG WORD — READ AT 0xC0000014
+======================================================================
+
+  Bit    Name          Meaning
+  -----  -----------   -----------------------------------------
+  31:24  magic=0xDB    If not 0xDB: bridge/bitstream broken
+  23     heartbeat     Toggles every ~1s (FPGA clock alive)
+  22     hps_reset_n   1 = HPS running
+  21     pio_dirty     1 = new PIO write, DDR3 write pending
+  20     ddr3_written  1 = DDR3 written at least once
+  19:18  seq_state     0=idle, 1=writing line A, 2=writing line B
+  17:0   reserved      0
+
+  Example: 0xDB700000 = magic OK, heartbeat=0, HPS up, idle, DDR3 done
+
+======================================================================
+ BUILD & DEPLOY
+======================================================================
+
+  Quartus project:  quatus/DE10_NANO_SoC_GHRD.qpf
+
+  1. Compile in Quartus (Ctrl+L) -> output_files/soc_system.rbf
+  2. cd MemorySystem/ && make stage   # copies RBF to drag/
+  3. Copy drag/ folder to SD card FAT partition
+  4. SSH in:
+       mount /dev/mmcblk0p1 /mnt/bootfat
+       cd /mnt/bootfat/drag && make deploy && reboot
+  5. After reboot:
+       cd /root/adder && make test
+
+  make deploy does: install RBF, patch DTB, compile C, install systemd
+  service for bridge enable, set static IP 192.168.0.2.
+
+  Quick recompile on running board:
+    gcc -O2 -o adder_test adder_test.c && ./enable_bridges && ./adder_test
+
+======================================================================
+ TROUBLESHOOTING
+======================================================================
+
+  devmem2 hangs / SSH dies:
+    - Using 0xFF200000? WRONG. Use 0xC0000000.
+    - Bridges off? Run: ./enable_bridges
+    - No bitstream? cat /sys/class/fpga_manager/fpga0/state -> "operating"
+    - Kill hung process: killall devmem2
+
+  Sum reads 0 or garbage:
+    - Read 0xC0000014: bits[31:24] must be 0xDB
+    - 0x00 = old/wrong bitstream.  0xFF = bridge off.
+
+  DDR3 wrong:
+    - Wait >= 20ms before reading
+    - Check debug_word bit 20 = 1 (ddr3_written)
+
+  LED[7] not blinking:
+    - Old bitstream. Recompile and redeploy.
+
+======================================================================
+ BUG HISTORY (all fixed)
+======================================================================
+
+  1. FATAL: adder_test used LW bridge 0xFF200000 but LWH2F is disabled
+     in Qsys. Any access hangs AXI bus. FIX: use 0xC0000000.
+
+  2. HIGH: pio64_out has no byteenable. 32-bit write clears other half.
+     FIX: cross-PIO add (one operand per PIO instance).
+
+  3. HIGH: Original adder added two halves of same PIO (impossible due
+     to bug 2). FIX: sum = adder_a[31:0] + adder_b[31:0].
+
+  4. LOW: pio64_in readdata = 'x when not reading (sim only).
+     FIX: default to 64'd0.
+
+  5. MEDIUM: DEADBEEF trigger checked sum_a not adder_a directly.
+     FIX: trigger on adder_a[31:0] == 0xDEADBEEF.
+
+  6. HIGH: Adding pio128_out to Qsys shifted all PIO addresses by 0x10.
+     adder_test.c had stale offsets. FIX: updated all offsets.
+
+======================================================================
+ FILES — KEY LOCATIONS
+======================================================================
+
+  quatus/DE10_NANO_SoC_GHRD.v      Top-level FPGA logic (adder, LEDs, DDR3)
+  quatus/ip/pio64/pio64_out.sv     64-bit output PIO (no byteenable)
+  quatus/ip/pio64/pio64_in.sv      64-bit input PIO (read-only)
+  quatus/ip/pio128/pio128_out.sv   128-bit output PIO (has byteenable)
+  quatus/simple_mem.sv             DDR3 writer (512-bit via 8x64-bit beats)
+  quatus/soc_system.qsys           Qsys system definition
+  drag/c_progs/adder_test.c        Main HPS test program
+  drag/c_progs/enable_bridges.c    Bridge enable (Reset+System Manager)
+  drag/Makefile                    Board-side deploy/test targets
+  MemorySystem/Makefile            PC-side stage/clean targets

@@ -1,0 +1,4 @@
+obj_dir/
+MemorySystem/transfer_quatus/db/
+MemorySystem/transfer_quatus/incremental_db/
+MemorySystem/transfer_quatus/hps_isw_handoff/

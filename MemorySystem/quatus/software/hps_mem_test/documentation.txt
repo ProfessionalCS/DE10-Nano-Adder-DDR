@@ -1,0 +1,821 @@
+MEMORY SUBSYSTEM GUIDE
+=====================
+
+Scope
+-----
+This guide is a source-based overview of how the DE10-Nano memory subsystem
+project works, from addresses and MMIO registers up through the host and board
+Makefiles.
+
+It is based on the following files:
+
+- `MemorySystem/instructions.txt`
+- `MemorySystem/Makefile`
+- `MemorySystem/transfer_quatus/Makefile`
+- `MemorySystem/transfer_quatus/software/hps_mem_test/Makefile`
+- `MemorySystem/transfer_quatus/software/spl_bsp/Makefile`
+- All user-facing C files in `MemorySystem/transfer_quatus/software/hps_mem_test/`
+- The small diagnostics in `MemorySystem/`:
+  `bridge_probe.c`, `pio_probe.c`, `reset_diag.c`
+
+
+1. Big Picture
+--------------
+The project implements a memory hierarchy in FPGA logic:
+
+  LSQ -> dTLB -> L1 -> L2 -> Avalon master -> HPS DDR3
+
+The HPS talks to that logic through three 64-bit PIO registers mapped into the
+HPS-to-FPGA bridge window at physical address `0xC0000000`.
+
+There are two major ways to use the project:
+
+1. Host simulation
+   - Run Verilator from `MemorySystem/Makefile`
+   - Main target: `make test`
+
+2. Real board bring-up and testing
+   - Program the DE10-Nano bitstream
+   - Enable bridges / DTB setup
+   - Run HPS-side test programs such as `mem_test`, `manual_test`,
+     `ddr3_test`, and `devmem_verify`
+
+
+2. End-to-End Data Flow
+-----------------------
+The typical path for a memory request is:
+
+1. A host-side trace file or an HPS-side test program creates a logical
+   operation such as LOAD, STORE, RESOLVE, or TLB_FILL.
+2. That operation is encoded into a 121-bit trace record.
+3. The HPS writes the record into two MMIO registers:
+   - `adder_b` first
+   - `adder_a` second
+4. The LSQ sees the new trace id and accepts the operation.
+5. The dTLB translates the virtual page to a physical page.
+6. L1 handles the access if it can.
+7. On an L1 miss, the request goes to L2.
+8. On an L2 miss, the Avalon master fetches or writes a cache line through the
+   FPGA-to-HPS memory path into DDR3.
+9. The FPGA writes status back into `adder_sum`, which the HPS reads to decide
+   whether the request hit in L1, hit in L2, or went all the way to DDR3.
+
+
+3. Address Map and Important Registers
+--------------------------------------
+
+3.1 HPS <-> FPGA bridge window
+The main software-visible register block is:
+
+  H2F bridge base: `0xC0000000`
+  Span:            `0x00001000`
+
+PIO offsets used by the HPS test programs:
+
+- `0x00` : `adder_sum`
+  - 64-bit read
+  - FPGA -> HPS
+  - Status / return data / writeback info
+
+- `0x08` : `adder_b`
+  - 64-bit write
+  - HPS -> FPGA
+  - Carries `trace_value[63:8]` and the `value_valid` bit
+
+- `0x10` : `adder_a`
+  - 64-bit write
+  - HPS -> FPGA
+  - Carries vaddr, id, op, vaddr_valid, and `trace_value[7:0]`
+
+All of the main HPS test tools map `/dev/mem` at `0xC0000000` and then use
+these three offsets.
+
+3.2 Reset / bridge / manager registers
+The bridge-enabling utilities use these physical addresses:
+
+- Reset Manager base: `0xFFD05000`
+  - `+0x1C` = `BRGMODRST`
+  - Bridge reset bits live here
+
+- System Manager base: `0xFFD08000`
+  - `+0x28` = `FPGAINTF`
+  - Enables FPGA interfaces
+
+- FPGA Manager base: `0xFF706000`
+  - Status / control registers for FPGA manager state
+
+- L3 remap base: `0xFF800000`
+  - Used by `fix_bridges.c` to expose H2F / LW H2F through L3 remap bits
+
+- SDRAM controller area: `0xFFC25000`
+  - `+0x80` used by `fix_bridges.c` as `fpgaportrst`
+  - Takes FPGA SDRAM-facing ports out of reset
+
+3.3 Boot partition paths used by board deployment
+The instructions and Makefiles assume:
+
+- Boot FAT partition device: `/dev/mmcblk0p1`
+- Mounted at: `/mnt/bootfat`
+- Bitstream filename on boot FAT: `soc_system.rbf`
+- DTB filename on boot FAT: `socfpga_cyclone5_de0_nano_soc.dtb`
+
+
+4. Trace Record Format
+----------------------
+The software tools all agree on the same split trace format:
+
+  trace_line[120:0] = { adder_b[56:0], adder_a[63:0] }
+
+`adder_a` fields:
+
+- `[47:0]`   = virtual address
+- `[51:48]`  = trace id
+- `[54:52]`  = opcode
+- `[55]`     = vaddr_valid
+- `[63:56]`  = value[7:0]
+
+`adder_b` fields:
+
+- `[55:0]`   = value[63:8]
+- `[56]`     = value_valid
+
+Opcode meanings used in the C utilities:
+
+- `0` = LOAD
+- `1` = STORE
+- `2` = RESOLVE
+- `4` = TLB_FILL
+
+Operational rule that matters:
+
+- Always write `adder_b` first, then `adder_a`.
+
+Reason:
+
+- The LSQ treats the id change in `adder_a` as the commit point for the new
+  operation, so `adder_b` must already contain the upper data bits.
+
+
+5. Status Register Format
+-------------------------
+The status register is read from `adder_sum` at offset `0x00`.
+
+Current board-side diagnostics (`manual_test.c`, `ddr3_test.c`,
+`devmem_verify.c`, and `stress_test.c`) interpret it as:
+
+- `[63]`    = cache return valid seen
+- `[62]`    = L1 miss / request sent to L2
+- `[61]`    = writeback seen
+- `[60]`    = L2 external read request / DDR3 fetch requested
+- `[59]`    = Avalon read asserted
+- `[58]`    = Avalon beat accepted
+- `[57]`    = Avalon readdatavalid seen
+- `[56:30]` = latched writeback address bits
+- `[29:0]`  = returned data low 30 bits
+
+Important limitation:
+
+- Returned data is only the low 30 bits in the status word.
+- That is why many examples mention values such as `0xDEADBEEF` coming back as
+  `0x1EADBEEF` or another low-30-bit equivalent.
+
+Status clear convention used by the tools:
+
+- Write `adder_b = 0xFFFFFFFFFFFFFFFE`
+- Then write `adder_b = 0`
+
+Some files still document an older view where `wb_addr` consumes bits `[59:30]`
+without the Avalon bits in `[59:57]`. For board debugging, trust the newer
+decoding used by `manual_test.c`, `ddr3_test.c`, `devmem_verify.c`, and
+`stress_test.c`.
+
+
+6. Virtual Addressing and TLB Behavior
+--------------------------------------
+Most test tools assume identity mapping:
+
+  virtual page == physical page
+
+That means a TLB fill typically sends the page address as both vpage and ppage.
+
+Practical implications:
+
+- Most board tests use virtual addresses that are also safe physical addresses.
+- `devmem_verify.c` relies on this: it stores through the FPGA path, then reads
+  the exact same physical location directly through `/dev/mem`.
+
+The tests often use page-aligned addresses spaced by `0x1000` because that
+forces repeated accesses into the same cache set and makes eviction behavior
+predictable.
+
+Example from `ddr3_test.c`:
+
+- Page-aligned addresses all map to set 0 because `(page_addr >> 6) % 4 == 0`
+  for the chosen geometry.
+- Two conflicting stores fill L1 set 0.
+- Four conflicting stores fill L2 set 0.
+- More conflicting stores force eviction to DDR3.
+
+
+7. What Each HPS C Utility Does
+-------------------------------
+
+7.1 `mem_test.c`
+Purpose:
+- Main lightweight board driver
+- Good first test after deployment
+
+Commands:
+- `./mem_test smoke`
+- `./mem_test trace <file.bin> [delay_us]`
+- `./mem_test status`
+
+What it does:
+- `smoke`:
+  - Seeds the trace id state with a NOP
+  - Sends a TLB fill
+  - Sends a load
+  - Sends another load to the same line
+  - Sends a store
+  - Loads the stored value back
+- `trace`:
+  - Replays a binary memory trace record by record
+  - Prints periodic status
+- `status`:
+  - Reads the current sticky status register
+
+Best use:
+- Quick sanity check that the FPGA is alive and the PIO path works
+- Replay of real trace files on hardware
+
+7.2 `manual_test.c`
+Purpose:
+- Interactive correctness tester with a software shadow memory
+
+Commands:
+- `./manual_test <clean|dirty> store <vaddr> <data>`
+- `./manual_test <clean|dirty> load <vaddr>`
+- `./manual_test <clean|dirty> test`
+- `./manual_test verify <trace.bin>`
+- `./manual_test verify <trace.bin> all`
+- `./manual_test verify <trace.bin> <addr> [...]`
+- `./manual_test status`
+- `./manual_test clear`
+
+Key ideas:
+- `clean` mode fills the TLB before each access
+- `dirty` mode assumes the TLB already has the mapping
+- `test` runs a built-in multi-case correctness suite
+- `verify` parses a trace in software, builds expected memory contents, then
+  verifies real hardware loads against those expected values
+
+Important dependency:
+- `verify` assumes you already replayed the trace through hardware, typically
+  with:
+
+    `./mem_test trace dgemm3_lsq88.bin 10`
+
+Best use:
+- General correctness checking after trace replay
+- Determining whether a load came from L1, L2, or DDR3
+
+7.3 `fpga_manual.c`
+Purpose:
+- Raw command-line interface for directly sending one operation at a time
+
+Commands:
+- `./fpga_manual status`
+- `./fpga_manual tlb_fill <vaddr_page> <paddr>`
+- `./fpga_manual load <id> <vaddr>`
+- `./fpga_manual store <id> <vaddr> <value>`
+- `./fpga_manual resolve <id> <vaddr> <value> [vv] [dv]`
+- `./fpga_manual reset`
+
+Notable behavior:
+- `reset` toggles H2F bridge reset through the Reset Manager and also sends a
+  NOP to seed `trace_id_prev`
+- Numeric arguments accept hex or decimal
+
+Best use:
+- Manual one-off experiments
+- Debugging LSQ behavior, ids, TLB fills, or RESOLVE traffic
+
+7.4 `ddr3_test.c`
+Purpose:
+- Focused proof that the request path actually reaches DDR3
+
+Method:
+- Store a known value to one target address
+- Fill the cache set with many conflicting pages
+- Force the target line to be evicted from L1 and L2
+- Load the target again
+- Check sticky bits to confirm:
+  - L1 miss happened
+  - L2 requested external data
+  - Avalon read handshake happened
+  - Data came back from DDR3
+
+Expected outcome:
+- PASS if DDR3 was reached and the returned value matches
+
+Best use:
+- Proving that misses can escape the cache hierarchy and fetch from DDR3
+
+7.5 `devmem_verify.c`
+Purpose:
+- Stronger proof than `ddr3_test.c`
+- Verifies that a value written through the FPGA path is actually present in
+  physical DDR3
+
+Method:
+- Store through the FPGA cache hierarchy
+- Force eviction to DDR3
+- Read the same physical address directly through `/dev/mem`
+- Compare the result
+
+Default target physical address:
+- `0x38001000`
+
+Best use:
+- Gold-standard DDR3 writeback proof
+
+7.6 `devmem2.c`
+Purpose:
+- Small generic physical memory read/write tool
+
+Usage:
+- `devmem2 ADDRESS [b|h|w|q] [VALUE]`
+
+Examples:
+- `devmem2 0xC0000000`
+- `devmem2 0xC0000004`
+- `devmem2 0xC0000008 w 0x1`
+- `devmem2 0xC0000010 w 0x2`
+
+Best use:
+- Manual MMIO inspection
+- Quick register pokes when you do not want to write a program
+
+7.7 `enable_bridges.c`
+Purpose:
+- Basic bridge enable utility
+
+What it changes:
+- Clears reset bits in `BRGMODRST`
+- Sets `FPGAINTF` bits to expose HPS/FPGA interfaces
+
+Best use:
+- Simple first try when bridge access is blocked
+
+7.8 `fix_bridges.c`
+Purpose:
+- More aggressive bridge repair utility
+
+What it touches:
+- L3 remap
+- Reset Manager bridge reset register
+- System Manager interface register
+- FPGA Manager status registers
+- SDRAM port reset register
+- Then attempts H2F access at `0xC0000000`
+
+Best use:
+- Use this when `enable_bridges.c` is not enough
+- This is the utility used by the board-side bring-up flow
+
+7.9 `setup_fpga.c`
+Purpose:
+- Low-level register dump and bridge-enabling helper
+
+What it actually does in code:
+- Dumps Reset Manager, System Manager, and FPGA Manager registers
+- Clears bridge resets and misc resets
+- Sets `fpgaintf`
+- Attempts an H2F read at `0xC0000000`
+
+Important note:
+- The file header says "program FPGA via overlay", but the actual code does not
+  copy an RBF or load an overlay. It is a reset/interface diagnostic, not a
+  full deployment tool.
+
+7.10 `stress_test.c`
+Purpose:
+- Deeper stress suite for the full memory path
+
+Covers:
+- Multiple data patterns
+- Back-to-back DDR3 reads
+- RAW chains
+- TLB pressure beyond 16 pages
+- Cross-set behavior
+- Repeated iterations
+
+Best use:
+- Longer stability testing after basic board bring-up works
+
+7.11 `test_bridge.c`, `test_bridge2.c`, `test_h2f.c`
+Purpose:
+- Direct bridge-access probes
+
+Use when:
+- `mmap` or reads from `0xC0000000` are failing
+- You want to separate "bridge is broken" from "memory subsystem is broken"
+
+7.12 `bridge_probe.c`, `pio_probe.c`, `reset_diag.c`
+Purpose:
+- Older standalone diagnostics located in the `MemorySystem/` root
+
+Use when:
+- You want a raw H2F probe from the root directory
+- You want to examine reset state or dump PIO contents
+
+
+8. The Makefiles and How They Relate
+------------------------------------
+
+8.1 `MemorySystem/Makefile`
+This is the main user-facing Makefile. It combines:
+
+- Verilator simulation
+- FPGA file sync
+- Bitstream conversion
+- Board deploy / status / test commands
+
+Simulation targets:
+- `make`
+- `make build`
+- `make run`
+- `make run-2k`
+- `make run-full`
+- `make test`
+- `make clean`
+
+FPGA prep targets:
+- `make sync-fpga`
+- `make hps-test`
+- `make rbf`
+
+What those do:
+- `make sync-fpga`
+  - Copies the current RTL files into `transfer_quatus/ip/mem_subsystem/`
+- `make hps-test`
+  - Cross-compiles `mem_test`, `fpga_manual`, `enable_bridges`, and `devmem2`
+- `make rbf`
+  - Converts `transfer_quatus/output_files/DE10_NANO_SoC_GHRD.sof`
+    into `transfer_quatus/output_files/soc_system.rbf`
+
+Board deployment / debug targets:
+- `make deploy`
+- `make deploy-quick`
+- `make recover`
+- `make board-fix-bridges`
+- `make board-setup`
+- `make board-install-service`
+- `make board-smoke`
+- `make board-ddr3`
+- `make board-devmem-verify`
+- `make board-test`
+- `make board-status`
+- `make board-reboot`
+- `make board-reboot-wait`
+- `make board-trace`
+- `make board-install-devmem`
+- `make board-devmem`
+- `make board-ssh`
+
+Important board target behavior:
+- `make deploy`
+  - Full board deployment path
+- `make deploy-quick`
+  - Uploads source files and compiles board utilities without rebooting
+- `make board-smoke`
+  - Runs `./mem_test smoke`
+- `make board-ddr3`
+  - Runs `./ddr3_test`
+- `make board-devmem-verify`
+  - Runs `./devmem_verify`
+- `make board-test`
+  - Runs `./manual_test clean test`
+- `make board-trace`
+  - Runs `./mem_test trace dgemm3_lsq88.bin <delay>`
+  - Default delay is 10 microseconds unless `TRACE_DELAY` is overridden
+
+Defaults baked into this Makefile:
+- Board IP: `192.168.0.2`
+- User: `root`
+- Password: `root`
+
+Current SSH behavior:
+- Uses `sshpass` if present
+- Falls back to plain `ssh` / `scp` if `sshpass` is not installed
+
+8.2 `transfer_quatus/Makefile`
+This is the larger Intel-generated Quartus/HPS build system. It is broader than
+the root Makefile and includes:
+
+- `quartus_compile`
+- `sof`
+- `rbf`
+- `create_rbf`
+- `pgm`
+- `program_fpga`
+- `program_qspi`
+- `preloader`
+- `uboot`
+- `dts`
+- `dtb`
+- `sd-fat`
+- `help`
+
+Use it when:
+- You are rebuilding the Quartus project itself
+- You need preloader / U-Boot / DTB packaging
+- You are generating SD-card FAT artifacts
+
+For most day-to-day memory-subsystem work, `MemorySystem/Makefile` is the
+simpler entry point.
+
+8.3 `transfer_quatus/software/hps_mem_test/Makefile`
+This is a tiny cross-compile Makefile:
+
+- Compiler: `arm-linux-gnueabihf-gcc`
+- Target: `mem_test`
+
+Targets:
+- `make`
+- `make clean`
+
+Important limitation:
+- It only builds `mem_test`
+- It does not build `manual_test`, `ddr3_test`, `devmem_verify`, or the other
+  utilities
+
+That is why the root `MemorySystem/Makefile` usually compiles the board tools
+on the board itself with native `gcc`.
+
+8.4 `transfer_quatus/software/spl_bsp/Makefile`
+This is the preloader/U-Boot BSP build system. It is not part of the normal
+memory-subsystem testing loop.
+
+Relevant targets include:
+- `all`
+- `uboot`
+- `spl`
+- `mkpimage-spl`
+- `tools`
+- `src`
+- `config`
+- `clean`
+- `clean-all`
+- patch targets
+
+Use it only if you are rebuilding the board boot software stack.
+
+
+9. Recommended Workflows
+------------------------
+
+9.1 Simulation only
+Run from `MemorySystem/`:
+
+1. `make build`
+2. `make run`
+3. `make test`
+
+Use this when:
+- You changed RTL
+- You want to validate behavior before touching the board
+
+9.2 Rebuild FPGA image after RTL edits
+Typical flow:
+
+1. `make sync-fpga`
+2. Recompile in Quartus
+3. `make rbf`
+4. `make deploy`
+
+Use this when:
+- RTL changed
+- You need a new `soc_system.rbf`
+
+9.3 Fast board-side software iteration
+If the bitstream is already good and you only changed the C tools:
+
+1. `make deploy-quick`
+2. `make board-status`
+3. Run whichever board test you need
+
+Use this when:
+- You edited `mem_test.c`, `manual_test.c`, `ddr3_test.c`, etc.
+- You do not want to reboot or reinstall the bitstream
+
+9.4 First full board bring-up
+Recommended sequence:
+
+1. Ensure `soc_system.rbf` exists
+2. `make deploy`
+3. `make board-status`
+4. `make board-smoke`
+5. `make board-ddr3`
+6. `make board-devmem-verify`
+7. `make board-test`
+
+9.5 Trace replay and verification
+Recommended sequence:
+
+1. `make board-trace`
+2. SSH to board or use `board-ssh`
+3. Run:
+   - `./manual_test verify dgemm3_lsq88.bin all`
+
+Equivalent concept:
+- Replay real operations first
+- Then verify expected stored values against later hardware loads
+
+
+10. How to Use the Major Board Tests
+------------------------------------
+
+10.1 Smoke test
+Purpose:
+- Prove that the HPS can talk to the PIOs and that basic TLB/load/store flow
+  is alive
+
+Run:
+- `make board-smoke`
+or
+- `./mem_test smoke`
+
+Good sign:
+- Status changes
+- A stored value can be loaded back
+
+10.2 DDR3 reachability test
+Purpose:
+- Prove a miss can make it all the way to DDR3
+
+Run:
+- `make board-ddr3`
+or
+- `./ddr3_test`
+
+Good sign:
+- PASS
+- Sticky bits show L1 miss, external read request, Avalon read, and returned
+  data
+
+10.3 Physical DDR3 proof
+Purpose:
+- Prove data is really in DRAM, not just in cache
+
+Run:
+- `make board-devmem-verify`
+or
+- `./devmem_verify`
+
+Good sign:
+- PASS
+- Direct `/dev/mem` readback matches the stored value
+
+10.4 Manual correctness suite
+Purpose:
+- Run a collection of hand-built functional cases
+
+Run:
+- `make board-test`
+or
+- `./manual_test clean test`
+
+
+11. Common Gotchas
+------------------
+
+11.1 Always change the trace id
+Most tools either rotate ids automatically or seed the previous id with a NOP.
+If you hand-roll operations, do not reuse the same id for consecutive requests
+unless you know the RTL can tolerate it.
+
+11.2 Seed `trace_id_prev`
+Several tools begin by sending:
+
+- op = 7
+- id = 15
+
+This is a harmless NOP-like record used to initialize the LSQ-side previous-id
+tracking.
+
+11.3 TLB fills come first
+If you access a page that the hardware TLB does not know yet, your test may
+hang or return nothing useful. `clean` mode in `manual_test` exists for this
+reason.
+
+11.4 Addresses in `manual_test`
+`manual_test.c` expects 8-byte-aligned addresses for load/store checks.
+
+11.5 `setup_fpga.c` is not a full deploy tool
+It is useful as a diagnostic, but it does not replace the documented bitstream
+and DTB deployment flow.
+
+11.6 `hps_mem_test/Makefile` only builds `mem_test`
+If you need `ddr3_test`, `manual_test`, or `devmem_verify`, compile them
+manually or use the root Makefile's board deployment path.
+
+
+12. Troubleshooting Map
+-----------------------
+
+Symptom: `Bus error` when reading or writing `0xC0000000`
+- H2F bridge not visible
+- FPGA bridges disabled
+- DTB not patched correctly
+- FPGA not programmed or board not fully up
+
+What to try:
+- `make board-status`
+- `make board-fix-bridges`
+- `make recover`
+
+Symptom: board tests run but status stays zero
+- Wrong bitstream
+- FPGA not operating
+- HPS/FPGA reset state still wrong
+
+What to try:
+- Check `/sys/class/fpga_manager/fpga0/state`
+- Check `br0` through `br3`
+- Run `test_h2f`, `test_bridge`, or `reset_diag`
+
+Symptom: DDR3 proof fails but smoke works
+- L1/L2 path is alive, but external memory path is not
+- `fpga2hps` / SDRAM path may still be disabled
+
+What to try:
+- `make board-ddr3`
+- `make board-devmem-verify`
+- `make board-fix-bridges`
+- Recheck bridge states
+
+Symptom: trace replay works but verify fails
+- Hardware state does not match software shadow memory
+- Store ordering / eviction / writeback issue
+- Trace replay and verify were run against different hardware state
+
+What to try:
+- Reboot board
+- Replay the trace again
+- Immediately run `manual_test verify ... all`
+
+
+13. Minimal Command Cheat Sheet
+-------------------------------
+
+Host simulation:
+- `make test`
+- `make run`
+
+FPGA image prep:
+- `make sync-fpga`
+- `make rbf`
+
+Board deploy:
+- `make deploy`
+- `make deploy-quick`
+- `make recover`
+
+Board checks:
+- `make board-status`
+- `make board-smoke`
+- `make board-ddr3`
+- `make board-devmem-verify`
+- `make board-test`
+- `make board-trace`
+
+Board shell:
+- `make board-ssh`
+
+Manual board commands:
+- `./mem_test smoke`
+- `./mem_test trace dgemm3_lsq88.bin 10`
+- `./manual_test clean test`
+- `./manual_test verify dgemm3_lsq88.bin all`
+- `./ddr3_test`
+- `./devmem_verify`
+- `./fpga_manual status`
+- `./fpga_manual store 2 0x1020 0xCAFEBABE`
+- `./fpga_manual load 3 0x1020`
+- `devmem2 0xC0000000`
+
+
+14. Practical Bottom Line
+-------------------------
+If you only remember one mental model, use this one:
+
+- The HPS writes two MMIO registers (`adder_b`, then `adder_a`) to inject a
+  trace-like memory operation into the FPGA.
+- The FPGA executes that request through LSQ, dTLB, L1, L2, and possibly DDR3.
+- The FPGA reports the result back through `adder_sum`.
+- The root `MemorySystem/Makefile` is the easiest entry point for simulation,
+  deployment, and routine board testing.
+- The C files in `hps_mem_test/` are the real software toolbox for proving each
+  stage of the system: liveness, correctness, cache behavior, bridge behavior,
+  and physical DDR3 access.
