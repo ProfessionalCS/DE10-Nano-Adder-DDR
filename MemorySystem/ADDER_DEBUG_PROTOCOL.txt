@@ -244,26 +244,10 @@ Board: DE10-Nano (Cyclone V 5CSEBA6U23I7)  SSH: root@192.168.0.2
     - Old bitstream. Recompile and redeploy.
 
 ======================================================================
- BUG HISTORY (all fixed)
+ BUG HISTORY 
 ======================================================================
 
-  1. FATAL: adder_test used LW bridge 0xFF200000 but LWH2F is disabled
-     in Qsys. Any access hangs AXI bus. FIX: use 0xC0000000.
-
-  2. HIGH: pio64_out has no byteenable. 32-bit write clears other half.
-     FIX: cross-PIO add (one operand per PIO instance).
-
-  3. HIGH: Original adder added two halves of same PIO (impossible due
-     to bug 2). FIX: sum = adder_a[31:0] + adder_b[31:0].
-
-  4. LOW: pio64_in readdata = 'x when not reading (sim only).
-     FIX: default to 64'd0.
-
-  5. MEDIUM: DEADBEEF trigger checked sum_a not adder_a directly.
-     FIX: trigger on adder_a[31:0] == 0xDEADBEEF.
-
-  6. HIGH: Adding pio128_out to Qsys shifted all PIO addresses by 0x10.
-     adder_test.c had stale offsets. FIX: updated all offsets.
+  1. add to this if you find anything
 
 ======================================================================
  FILES — KEY LOCATIONS
