@@ -262,4 +262,4 @@ Board: DE10-Nano (Cyclone V 5CSEBA6U23I7)  SSH: root@192.168.0.2
   drag/c_progs/adder_test.c        Main HPS test program
   drag/c_progs/enable_bridges.c    Bridge enable (Reset+System Manager)
   drag/Makefile                    Board-side deploy/test targets
-  MemorySystem/Makefile            PC-side stage/clean targets
+  Makefile                         PC-side stage/clean targets

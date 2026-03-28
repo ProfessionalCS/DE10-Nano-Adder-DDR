@@ -17,8 +17,10 @@ module pio128_out (
     input  logic [15:0]   avs_s0_byteenable,
     input  logic [127:0]  avs_s0_writedata,
 
-    // FPGA-side output
-    output logic [127:0]  pio_out
+    // FPGA-side outputs (Qsys generates two ports: one for the
+    // avalon_slave_0 readdata interface, one for the pio128 conduit)
+    output logic [127:0]  pio_out,
+    output logic [127:0]  pio128_out
 );
 
 always_ff @(posedge clk) begin
@@ -31,5 +33,7 @@ always_ff @(posedge clk) begin
         end
     end
 end
+
+assign pio128_out = pio_out;
 
 endmodule
